@@ -1,228 +1,116 @@
 import os
-import streamlit as st
+import re
+import pandas as pd
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-import networkx as nx
-from pyvis.network import Network
-import tempfile
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain.tools import Tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-# ================== 配置与初始化 ==================
+# ===================== 1. 基础配置 =====================
+# 加载环境变量（请在同级目录创建 .env 文件，填写 OPENAI_API_KEY）
 load_dotenv()
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 
-# 页面配置
-st.set_page_config(page_title="科研文献智能助手 MVP", layout="wide")
-st.title("📚 科研文献挖掘与知识图谱系统 (MVP)")
+# 初始化大模型（可替换为通义千问/文心一言/本地Llama）
+llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.1)
 
-# 侧边栏：API 配置
-with st.sidebar:
-    st.header("⚙️ 模型配置")
-    api_key = st.text_input("OpenAI API Key", type="password", value=os.getenv("OPENAI_API_KEY", ""))
-    base_url = st.text_input("API Base URL (可选，用于本地模型)", value=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
-    model_name = st.text_input("Model Name", value="gpt-4o-mini") # 推荐使用 gpt-4o-mini 或 gpt-4o
-    
-    st.markdown("---")
-    st.markdown("### 💡 使用说明")
-    st.markdown("1. 输入 API 配置\n2. 上传 PDF 文献\n3. 等待解析并查看知识图谱\n4. 基于文献提问")
-
-# 初始化 LLM
-def init_llm():
-    if not api_key:
-        st.warning("请先在侧边栏输入 API Key")
-        return None
-    return ChatOpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        model=model_name,
-        temperature=0.1
-    )
-
-# ================== 核心功能函数 ==================
-
-def extract_text_from_pdf(uploaded_file):
-    """从上传的 PDF 提取文本"""
-    text = ""
-    pdf_reader = PdfReader(uploaded_file)
-    for page in pdf_reader.pages:
-        text += page.extract_text() or ""
-    return text
-
-def split_text(text):
-    """切分长文本"""
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=200,
-        length_function=len
-    )
-    return text_splitter.split_text(text)
-
-def analyze_paper_core_elements(llm, text_chunks):
-    """使用 LLM 提取论文核心要素 (痛点、方法、结论、创新点)"""
-    system_prompt = """
-    你是一个专业的科研文献分析助手。请基于提供的文献片段，提取以下核心信息：
-    1. 研究背景与核心痛点 (Research_Pain_Points)
-    2. 核心研究方法 (Core_Methods)
-    3. 主要结论与发现 (Key_Conclusions)
-    4. 主要创新点 (Innovations)
-    
-    请以 JSON 格式返回，键名必须严格为：Research_Pain_Points, Core_Methods, Key_Conclusions, Innovations。
-    如果某部分信息不足，请填 "未明确提及"。
-    """
-    
-    # 为了节省 Token，我们取前 3 个最相关的片段（这里简化为前 3 段）
-    context = "\n\n---\n\n".join(text_chunks[:3])
-    
+# ===================== 2. 公共工具函数 =====================
+def read_pdf(pdf_path: str) -> str:
+    """读取PDF文献，返回纯文本"""
     try:
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=f"请分析以下文献片段：\n\n{context}")
-        ])
-        # 简单的 JSON 提取（实际生产中需用 OutputParser）
-        content = response.content
-        # 清理 markdown 标记
-        json_str = content.replace("```json", "").replace("```", "").strip()
-        return eval(json_str) # 仅 MVP 演示用，生产环境请用 json.loads
+        reader = PdfReader(pdf_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text()
+        return text[:10000]  # 截断文本避免超限
     except Exception as e:
-        st.error(f"分析失败: {e}")
-        return None
+        return f"PDF读取失败：{str(e)}"
 
-def build_knowledge_graph(llm, text_chunks):
-    """构建简单的知识图谱 (实体-关系-实体)"""
-    system_prompt = """
-    你是一个知识图谱构建专家。请从文献中提取 10-15 个最重要的学术概念或实体，并提取它们之间的关系。
-    
-    返回格式要求：每行一条三元组，格式为 "实体1|关系|实体2"。
-    例如：
-    过敏性肺炎|引发|肺纤维化
-    TGF-beta|调控|ECM沉积
-    
-    只返回三元组，不要任何其他文字。
-    """
-    
-    context = "\n\n".join(text_chunks[:4])
-    
-    try:
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=f"文献内容：\n\n{context}")
-        ])
-        
-        lines = response.content.strip().split("\n")
-        G = nx.DiGraph()
-        
-        for line in lines:
-            if "|" in line:
-                parts = line.split("|")
-                if len(parts) == 3:
-                    e1, rel, e2 = parts
-                    G.add_node(e1, title=e1)
-                    G.add_node(e2, title=e2)
-                    G.add_edge(e1, e2, label=rel)
-        return G
-    except Exception as e:
-        st.error(f"图谱构建失败: {e}")
-        return nx.DiGraph()
+def extract_entities(text: str) -> dict:
+    """从文本提取疾病、基因、通路等核心实体（生信专用）"""
+    pattern_disease = re.compile(r'(cancer|tumor|diabetes|hypertension|OHP|ovarian cancer)', re.I)
+    pattern_gene = re.compile(r'[A-Z]{2,}[0-9]?')  # 基因命名规则
+    diseases = list(set(pattern_disease.findall(text)))
+    genes = list(set(pattern_gene.findall(text)))[:10]
+    return {"疾病": diseases, "基因": genes, "通路": ["PI3K-Akt", "MAPK", "Wnt"]}  # 预设生信通路
 
-def answer_question(llm, text_chunks, question):
-    """基于文献内容回答问题"""
-    context = "\n\n".join(text_chunks)
-    
-    system_prompt = """
-    你是一个专业的科研助手。请仅基于提供的文献上下文回答用户的问题。
-    如果答案不在上下文中，请明确说明“根据提供的文献内容无法回答该问题”。
-    回答要专业、准确、有条理。
-    """
-    
-    response = llm.invoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=f"上下文：\n{context}\n\n问题：{question}")
+# 封装为LangChain工具
+tools = [
+    Tool(name="读取PDF文献", func=read_pdf, description="输入PDF文件路径，返回文献文本内容"),
+    Tool(name="提取生信实体", func=extract_entities, description="输入文本，提取疾病、基因、信号通路实体")
+]
+
+# ===================== 3. 四大核心Agent定义 =====================
+# 通用Agent模板
+def create_research_agent(role_prompt: str):
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", role_prompt),
+        ("user", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
-    return response.content
+    agent = create_openai_tools_agent(llm, tools, prompt)
+    return AgentExecutor(agent=agent, tools=tools, verbose=False)
 
-# ================== 界面逻辑 ==================
+# 1. 文献解析Agent：批量解析PDF，提取核心数据
+agent1_parse = create_research_agent(
+    "你是专业的生信文献解析专家，负责读取PDF文献，提取研究目的、实验数据、核心结论"
+)
 
-def main():
-    llm = init_llm()
-    
-    # 文件上传
-    uploaded_file = st.file_uploader("请上传一篇科研文献 (PDF格式)", type="pdf")
-    
-    if uploaded_file and llm:
-        with st.spinner("正在解析文献..."):
-            # 1. 提取文本
-            raw_text = extract_text_from_pdf(uploaded_file)
-            # 2. 切分文本
-            text_chunks = split_text(raw_text)
-            
-            st.success("✅ 文献解析成功！")
-            
-            # 存储到 session state 以便后续交互
-            if 'text_chunks' not in st.session_state:
-                st.session_state['text_chunks'] = text_chunks
-                st.session_state['llm'] = llm
+# 2. 知识图谱Agent：构建疾病-基因-通路关联关系
+agent2_knowledge = create_research_agent(
+    "你是知识图谱构建专家，基于提取的实体，梳理疾病、基因、通路的关联关系"
+)
 
-        # 布局：左侧核心信息，右侧图谱
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
-            st.subheader("🔬 文献核心要素提取")
-            if st.button("开始分析核心要素"):
-                with st.spinner("AI 正在阅读并总结..."):
-                    core_info = analyze_paper_core_elements(llm, text_chunks)
-                    if core_info:
-                        st.session_state['core_info'] = core_info
-            
-            if 'core_info' in st.session_state:
-                info = st.session_state['core_info']
-                st.markdown("### 1. 研究背景与痛点")
-                st.write(info.get('Research_Pain_Points', ''))
-                st.markdown("### 2. 核心研究方法")
-                st.write(info.get('Core_Methods', ''))
-                st.markdown("### 3. 主要结论")
-                st.write(info.get('Key_Conclusions', ''))
-                st.markdown("### 4. 创新点")
-                st.write(info.get('Innovations', ''))
+# 3. 推理验证Agent：生成科研假设，生成分析脚本
+agent3_reason = create_research_agent(
+    "你是生信科研推理专家，基于关联图谱生成可验证的科学假设，输出GEO数据集分析脚本"
+)
 
-        with col2:
-            st.subheader("🕸️ 文献知识图谱")
-            if st.button("构建知识图谱"):
-                with st.spinner("正在构建实体关系网络..."):
-                    G = build_knowledge_graph(llm, text_chunks)
-                    st.session_state['kgraph'] = G
-            
-            if 'kgraph' in st.session_state:
-                G = st.session_state['kgraph']
-                if len(G.nodes) > 0:
-                    # 使用 PyVis 可视化
-                    nt = Network(notebook=True, height="500px", width="100%", directed=True)
-                    nt.from_nx(G)
-                    
-                    # 生成临时 HTML 文件
-                    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.html') as f:
-                        nt.write_html(f.name)
-                    
-                    # 读取并展示
-                    with open(f.name, 'r', encoding='utf-8') as f:
-                        html_content = f.read()
-                    
-                    st.components.v1.html(html_content, height=550)
-                else:
-                    st.info("未能提取到足够的实体关系")
+# 4. 报告生成Agent：自动生成科研调研报告
+agent4_report = create_research_agent(
+    "你是科研报告撰写专家，整合所有结果，生成结构化的课题调研初稿"
+)
 
-        st.markdown("---")
-        
-        # 问答区域
-        st.subheader("💬 基于文献的智能问答")
-        user_question = st.text_input("请针对这篇文献提问：")
-        
-        if user_question and 'text_chunks' in st.session_state:
-            if st.button("获取答案"):
-                with st.spinner("正在思考..."):
-                    answer = answer_question(llm, st.session_state['text_chunks'], user_question)
-                    st.markdown("### 📝 回答：")
-                    st.write(answer)
+# ===================== 4. 多Agent协作主流程 =====================
+def research_assistant_main(pdf_path: str):
+    print("="*50)
+    print("🚀 多Agent科研文献挖掘助手启动")
+    print("="*50)
 
+    # Step1：文献解析Agent执行
+    print("\n📄 【Agent1】文献解析中...")
+    parse_result = agent1_parse.invoke({"input": f"解析这个文献：{pdf_path}，提取核心内容"})
+    print("✅ 文献解析完成")
+
+    # Step2：知识图谱Agent执行
+    print("\n🔗 【Agent2】构建知识图谱中...")
+    entity_data = extract_entities(parse_result["output"])
+    knowledge_result = agent2_knowledge.invoke({"input": f"构建关联关系：{entity_data}"})
+    print("✅ 知识图谱构建完成")
+
+    # Step3：推理验证Agent执行
+    print("\n🧠 【Agent3】生成科研假设中...")
+    reason_result = agent3_reason.invoke({"input": f"基于{knowledge_result}生成科研假设+GEO分析脚本"})
+    print("✅ 科研假设生成完成")
+
+    # Step4：报告生成Agent执行
+    print("\n📝 【Agent4】生成科研报告中...")
+    final_report = agent4_report.invoke({
+        "input": f"整合以下内容生成报告：\n文献解析：{parse_result}\n知识图谱：{knowledge_result}\n假设：{reason_result}"
+    })
+
+    # 保存最终报告
+    with open("科研文献分析报告.md", "w", encoding="utf-8") as f:
+        f.write(final_report["output"])
+
+    print("\n🎉 全部执行完成！报告已保存为：科研文献分析报告.md")
+    print("="*50)
+    return final_report["output"]
+
+# ===================== 5. 运行入口 =====================
 if __name__ == "__main__":
-    main()
+    # 替换为你的科研PDF路径（支持生信/医学PDF）
+    YOUR_PDF_PATH = "research_paper.pdf"
+    research_assistant_main(YOUR_PDF_PATH)
